@@ -16,6 +16,7 @@ Slowly print a directory tree. PATH defaults to the current directory.
 Options:
   -d, --depth LEVELS  Levels to display; 0 shows only the root [default: 2]
   --delay-ms MS   Delay per line [default: 25 in terminals, 0 otherwise]
+  --color WHEN   Color output: auto, always, never [default: auto]
   -a, --all       Show hidden entries
   -h, --help      Print help
 
@@ -29,6 +30,7 @@ struct Config {
     depth: usize,
     delay: Duration,
     all: bool,
+    color: bool,
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
@@ -62,6 +64,10 @@ fn parse_args(
     let mut depth = 2;
     let mut delay_ms = if terminal { 25 } else { 0 };
     let mut all = false;
+    let auto_color = terminal
+        && env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+        && env::var_os("TERM").is_none_or(|value| value != "dumb");
+    let mut color = auto_color;
     let mut options = true;
 
     while let Some(arg) = args.next() {
@@ -76,16 +82,25 @@ fn parse_args(
                 if next_str.starts_with('-') {
                     1
                 } else {
-                    next
-                        .to_str()
-                        .and_then(|v| v.parse().ok())
-                        .ok_or_else(|| invalid_input(format!("invalid value for {arg_str}: {}", next.to_string_lossy())))?
+                    next.to_str().and_then(|v| v.parse().ok()).ok_or_else(|| {
+                        invalid_input(format!(
+                            "invalid value for {arg_str}: {}",
+                            next.to_string_lossy()
+                        ))
+                    })?
                 }
             } else {
                 1
             };
         } else if options && arg == OsStr::new("--delay-ms") {
             delay_ms = parse_number(&mut args, "--delay-ms")?;
+        } else if options && arg == OsStr::new("--color") {
+            color = match args.next().as_deref().and_then(OsStr::to_str) {
+                Some("auto") => auto_color,
+                Some("always") => true,
+                Some("never") => false,
+                _ => return Err(invalid_input("--color requires auto, always, or never")),
+            };
         } else if options && arg == OsStr::new("--") {
             options = false;
         } else if options && arg.to_string_lossy().starts_with('-') {
@@ -106,6 +121,7 @@ fn parse_args(
         depth,
         delay: Duration::from_millis(delay_ms),
         all,
+        color,
     }))
 }
 
@@ -121,6 +137,51 @@ fn path_error(path: &Path, error: io::Error) -> io::Error {
         error.kind(),
         format!("{}: {error}", display_name(path.as_os_str())),
     )
+}
+
+fn colored_name(path: &Path, name: &str, marker: &str, color: bool) -> io::Result<String> {
+    let label = format!("{name}{marker}");
+    if !color {
+        return Ok(label);
+    }
+    let style = if marker == "@" {
+        "36"
+    } else if marker == "/" || name.ends_with('/') {
+        "1;34"
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+            let metadata = fs::symlink_metadata(path).map_err(|error| path_error(path, error))?;
+            let kind = metadata.file_type();
+            if kind.is_socket() {
+                return Ok(format!("\x1b[35m{label}\x1b[0m"));
+            }
+            if kind.is_fifo() || kind.is_block_device() || kind.is_char_device() {
+                return Ok(format!("\x1b[33m{label}\x1b[0m"));
+            }
+            if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+                return Ok(format!("\x1b[1;32m{label}\x1b[0m"));
+            }
+        }
+        match path
+            .extension()
+            .and_then(OsStr::to_str)
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "zip" | "gz" | "bz2" | "xz" | "zst" | "tar" | "7z" | "rar" => "1;31",
+            "jpg" | "jpeg" | "png" | "gif" | "svg" | "webp" | "ico" | "mp4" | "mkv" | "mov"
+            | "webm" => "35",
+            "mp3" | "wav" | "flac" | "ogg" | "m4a" => "36",
+            "md" | "txt" | "pdf" | "doc" | "docx" | "rst" => "33",
+            "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "c" | "h" | "cpp" | "java"
+            | "sh" => "32",
+            _ => return Ok(label),
+        }
+    };
+    Ok(format!("\x1b[{style}m{label}\x1b[0m"))
 }
 
 fn list_dir(path: &Path, all: bool) -> io::Result<Vec<DirEntry>> {
@@ -179,9 +240,10 @@ fn walk<W: Write>(
         } else {
             ""
         };
+        let name = colored_name(&entry.path(), &name, marker, config.color)?;
         print_line(
             writer,
-            &format!("{prefix}{branch}{name}{marker}{limit}"),
+            &format!("{prefix}{branch}{name}{limit}"),
             config.delay,
         )?;
 
@@ -227,7 +289,8 @@ fn run(
     } else {
         ""
     };
-    print_line(writer, &format!("{root_name}{marker}{limit}"), config.delay)?;
+    let root_name = colored_name(&config.root, &root_name, marker, config.color)?;
+    print_line(writer, &format!("{root_name}{limit}"), config.delay)?;
     walk(writer, &config.root, "", 1, &config)
 }
 
@@ -333,6 +396,56 @@ mod tests {
         assert!(output.contains("child"));
         assert!(!output.contains(".hidden"));
         assert!(!output.contains("too-deep"));
+        assert!(!output.contains('\x1b'));
+
+        File::create(root.join("photo.PNG")).unwrap();
+        File::create(root.join("archive.zip")).unwrap();
+        File::create(root.join("readme.md")).unwrap();
+        File::create(root.join("main.rs")).unwrap();
+        File::create(root.join("song.mp3")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            File::create(root.join("launch")).unwrap();
+            fs::set_permissions(root.join("launch"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for mode in ["always", "never", "auto"] {
+            let mut colored = Vec::new();
+            run(
+                ["--delay-ms", "0", "--color", mode]
+                    .map(OsString::from)
+                    .into_iter()
+                    .chain([root.clone().into_os_string()]),
+                &mut colored,
+                false,
+            )
+            .unwrap();
+            let colored = String::from_utf8(colored).unwrap();
+            if mode == "always" {
+                for label in [
+                    "1;34mroot/",
+                    "1;34msub/",
+                    "35mphoto.PNG",
+                    "1;31marchive.zip",
+                    "33mreadme.md",
+                    "32mmain.rs",
+                    "36msong.mp3",
+                ] {
+                    assert!(colored.contains(&format!("\x1b[{label}\x1b[0m")));
+                }
+                assert!(colored.contains("\x1b[0m [depth limit]"));
+                #[cfg(unix)]
+                {
+                    assert!(colored.contains("\x1b[36mlink@\x1b[0m"));
+                    assert!(colored.contains("\x1b[1;32mlaunch\x1b[0m"));
+                }
+            } else {
+                assert!(!colored.contains('\x1b'));
+            }
+        }
+        for args in [vec!["--color"], vec!["--color", "invalid"]] {
+            assert!(parse_args(args.into_iter().map(OsString::from), false).is_err());
+        }
 
         #[cfg(unix)]
         {

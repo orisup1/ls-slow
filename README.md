@@ -21,6 +21,7 @@ Options:
   --size         Show file sizes (decimal units)
   --sort KEY     Sort by name, size (largest), or modified (newest)
   --git          Show Git status
+  --gitignore    Skip Git-ignored entries (requires a working tree)
   --summary      Count displayed directories and files
   -a, --all       Show hidden entries
   -h, --help      Print help
@@ -49,6 +50,7 @@ Colors are disabled for pipes, redirected output, `TERM=dumb`, or a nonempty
 ```sh
 sls --ignore 'node_modules,target,*.log' --size --sort modified
 sls --git --summary
+sls --gitignore
 ```
 
 Ignore patterns match entry names at every depth, including with `--all`.
@@ -66,7 +68,18 @@ Git's two-column status: the first column describes staged changes, the second
 unstaged changes; `??` means untracked, `!!` ignored, and `**` marks a directory
 containing changes. Renames appear as deletions and additions. Deleted entries
 are absent from the tree but still mark their parent directory. Hidden entries
-remain hidden unless `--all` is used. Git is not invoked without `--git`.
+remain hidden unless `--all` is used. Git is invoked only with `--git` or
+`--gitignore`.
+
+`--gitignore` uses Git's ignore rules, including nested `.gitignore` files,
+repository excludes, and global excludes. Ignored directories are skipped
+entirely; tracked files remain visible even if an ignore pattern matches.
+It requires Git and a working tree. Combine it with `--git` to show status.
+
+Directories that cannot be listed show `[permission denied]` or an error
+marker. Listing continues through readable siblings, including the summary
+when requested, then exits with a nonzero status. The summary counts displayed
+entries only; error markers do not count as files.
 
 `--summary` counts only displayed entries, excluding the root and anything
 hidden, ignored, or beyond the depth limit. Symlinks and special entries count

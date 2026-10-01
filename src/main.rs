@@ -23,6 +23,7 @@ Options:
   --size         Show file sizes (decimal units)
   --sort KEY     Sort by name, size (largest), or modified (newest)
   --git          Show Git status
+  --gitignore    Skip Git-ignored entries (requires a working tree)
   --summary      Count displayed directories and files
   -a, --all       Show hidden entries
   -h, --help      Print help
@@ -42,6 +43,7 @@ struct Config {
     size: bool,
     sort: String,
     git: bool,
+    gitignore: bool,
     summary: bool,
 }
 
@@ -85,6 +87,7 @@ fn parse_args(
     let mut size = false;
     let mut sort = String::from("name");
     let mut git = false;
+    let mut gitignore = false;
     let mut summary = false;
 
     while let Some(arg) = args.next() {
@@ -130,6 +133,8 @@ fn parse_args(
             };
         } else if options && arg == OsStr::new("--git") {
             git = true;
+        } else if options && arg == OsStr::new("--gitignore") {
+            gitignore = true;
         } else if options && arg == OsStr::new("--summary") {
             summary = true;
         } else if options && arg == OsStr::new("--") {
@@ -157,6 +162,7 @@ fn parse_args(
         size,
         sort,
         git,
+        gitignore,
         summary,
     }))
 }
@@ -268,7 +274,7 @@ fn git_path(bytes: &[u8]) -> io::Result<PathBuf> {
     }
 }
 
-fn git_status(root: &Path) -> io::Result<HashMap<PathBuf, String>> {
+fn git_status(root: &Path, option: &str, gitignore: bool) -> io::Result<HashMap<PathBuf, String>> {
     let git = |args: &[&str]| -> io::Result<Vec<u8>> {
         let output = Command::new("git")
             .arg("-C")
@@ -276,10 +282,10 @@ fn git_status(root: &Path) -> io::Result<HashMap<PathBuf, String>> {
             .args(args)
             .env("GIT_OPTIONAL_LOCKS", "0")
             .output()
-            .map_err(|error| io::Error::new(error.kind(), format!("--git: {error}")))?;
+            .map_err(|error| io::Error::new(error.kind(), format!("{option}: {error}")))?;
         if !output.status.success() {
             return Err(io::Error::other(format!(
-                "--git: {}",
+                "{option}: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
@@ -303,7 +309,7 @@ fn git_status(root: &Path) -> io::Result<HashMap<PathBuf, String>> {
         .filter(|record| !record.is_empty())
     {
         if record.len() < 4 || record[2] != b' ' {
-            return Err(io::Error::other("--git: invalid status record"));
+            return Err(io::Error::other(format!("{option}: invalid status record")));
         }
         let path = top.join(git_path(&record[3..])?);
         let status = String::from_utf8_lossy(&record[..2]).into_owned();
@@ -318,10 +324,33 @@ fn git_status(root: &Path) -> io::Result<HashMap<PathBuf, String>> {
                 .or_insert_with(|| "**".to_owned());
         }
     }
+    if gitignore {
+        let ignored = git(&[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "--full-name",
+            "-z",
+            "--",
+            ".",
+        ])?;
+        for path in ignored
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            statuses.insert(top.join(git_path(path)?), "!!".to_owned());
+        }
+    }
     Ok(statuses)
 }
 
-fn list_dir(path: &Path, config: &Config) -> io::Result<Vec<DirEntry>> {
+fn list_dir(
+    path: &Path,
+    config: &Config,
+    git: &HashMap<PathBuf, String>,
+) -> io::Result<Vec<DirEntry>> {
     let entries = fs::read_dir(path).map_err(|error| path_error(path, error))?;
     let mut items = Vec::new();
 
@@ -329,14 +358,20 @@ fn list_dir(path: &Path, config: &Config) -> io::Result<Vec<DirEntry>> {
         let entry = entry.map_err(|error| path_error(path, error))?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if (config.all || !name.starts_with('.'))
-            && !config
+        if (!config.all && name.starts_with('.'))
+            || (config.gitignore
+                && entry
+                    .path()
+                    .ancestors()
+                    .any(|path| git.get(path).is_some_and(|s| s == "!!")))
+            || config
                 .ignore
                 .iter()
                 .any(|pattern| matches_pattern(pattern, &name))
         {
-            items.push(entry);
+            continue;
         }
+        items.push(entry);
     }
 
     match config.sort.as_str() {
@@ -385,14 +420,26 @@ fn walk<W: Write>(
     depth: usize,
     config: &Config,
     git: &HashMap<PathBuf, String>,
-) -> io::Result<(usize, usize)> {
+) -> io::Result<(usize, usize, Option<io::Error>)> {
     if depth > config.depth {
-        return Ok((0, 0));
+        return Ok((0, 0, None));
     }
 
     let mut directories = 0;
     let mut files = 0;
-    let items = list_dir(dir, config)?;
+    let mut listing_error = None;
+    let items = match list_dir(dir, config, git) {
+        Ok(items) => items,
+        Err(error) => {
+            let marker = if error.kind() == io::ErrorKind::PermissionDenied {
+                "permission denied".to_owned()
+            } else {
+                format!("error: {error}")
+            };
+            print_line(writer, &format!("{prefix}└── [{marker}]"), config.delay)?;
+            return Ok((0, 0, Some(error)));
+        }
+    };
     let count = items.len();
     for (index, entry) in items.iter().enumerate() {
         let last = index + 1 == count;
@@ -427,6 +474,7 @@ fn walk<W: Write>(
         };
         let status = git
             .get(&entry.path())
+            .filter(|_| config.git)
             .map(|status| format!(" [{status}]"))
             .unwrap_or_default();
         let name = colored_name(&entry.path(), &name, marker, config.color)?;
@@ -438,13 +486,16 @@ fn walk<W: Write>(
 
         if depth < config.depth && kind.is_dir() {
             let next_prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
-            let (child_dirs, child_files) =
+            let (child_dirs, child_files, child_error) =
                 walk(writer, &entry.path(), &next_prefix, depth + 1, config, git)?;
             directories += child_dirs;
             files += child_files;
+            if listing_error.is_none() {
+                listing_error = child_error;
+            }
         }
     }
-    Ok((directories, files))
+    Ok((directories, files, listing_error))
 }
 
 fn run(
@@ -482,15 +533,19 @@ fn run(
         ""
     };
     let root_name = colored_name(&config.root, &root_name, marker, config.color)?;
-    let git = if config.git {
+    let git = if config.git || config.gitignore {
         config.root =
             fs::canonicalize(&config.root).map_err(|error| path_error(&config.root, error))?;
-        git_status(&config.root)?
+        git_status(
+            &config.root,
+            if config.git { "--git" } else { "--gitignore" },
+            config.gitignore,
+        )?
     } else {
         HashMap::new()
     };
     print_line(writer, &format!("{root_name}{limit}"), config.delay)?;
-    let (directories, files) = walk(writer, &config.root, "", 1, &config, &git)?;
+    let (directories, files, listing_error) = walk(writer, &config.root, "", 1, &config, &git)?;
     if config.summary {
         print_line(
             writer,
@@ -498,7 +553,10 @@ fn run(
             config.delay,
         )?;
     }
-    Ok(())
+    match listing_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn main() -> ExitCode {
@@ -665,7 +723,68 @@ mod tests {
         assert!(output.contains("new\\nfile [??]"));
         assert!(render(&["--git"], &root.join("sub")).contains("new\\nfile [??]"));
         assert!(!render(&[], &root).contains("[??]"));
+        fs::write(root.join("sub/.gitignore"), "*.tmp\n!keep.tmp\n").unwrap();
+        fs::write(root.join("sub/drop.tmp"), b"ignored").unwrap();
+        fs::write(root.join("sub/keep.tmp"), b"included").unwrap();
+        let output = render(&["--gitignore", "--all", "--summary"], &root);
+        assert!(!output.contains("node_modules"));
+        assert!(!output.contains("skip.log"));
+        assert!(!output.contains("drop.tmp"));
+        assert!(output.contains("keep.tmp"));
+        assert!(!output.contains("[??]"));
+        let output = render(&["--gitignore", "--git"], &root.join("sub"));
+        assert!(output.contains("keep.tmp [??]"));
+        assert!(!output.contains("drop.tmp"));
+        assert!(!render(&["--gitignore"], &root.join("node_modules")).contains("nested"));
+        git(&["add", "--force", "skip.log"]);
+        assert!(render(&["--gitignore"], &root).contains("skip.log"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("sls-permissions-{}-{unique}", std::process::id()));
+        let blocked = root.join("a-blocked");
+        fs::create_dir_all(&blocked).unwrap();
+        fs::create_dir_all(root.join("z-readable")).unwrap();
+        fs::write(root.join("z-readable/child"), b"visible").unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = fs::read_dir(&blocked).is_err();
+        let mut output = Vec::new();
+        let result = run(
+            [OsString::from("--summary"), root.as_os_str().to_owned()],
+            &mut output,
+            false,
+        );
+        let mut root_output = Vec::new();
+        let root_result = run([blocked.as_os_str().to_owned()], &mut root_output, false);
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        // Privileged users can read mode-000 directories.
+        if !denied {
+            return;
+        }
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("│   └── [permission denied]"), "{output}");
+        assert!(output.contains("z-readable/\n    └── child"), "{output}");
+        assert!(output.contains("2 directories, 1 files"), "{output}");
+        assert_eq!(
+            root_result.unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(
+            String::from_utf8(root_output)
+                .unwrap()
+                .contains("[permission denied]")
+        );
     }
 
     #[test]

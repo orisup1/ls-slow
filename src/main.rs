@@ -22,7 +22,7 @@ Options:
   --ignore LIST  Comma-separated name patterns (* and ?); repeatable
   --size         Show file sizes (decimal units)
   --sort KEY     Sort by name, size (largest), or modified (newest)
-  --git          Show Git status
+  --git          Show only Git-changed/untracked entries with status
   --gitignore    Skip Git-ignored entries (requires a working tree)
   --summary      Count displayed directories and files
   -a, --all       Show hidden entries
@@ -313,7 +313,11 @@ fn git_status(root: &Path, option: &str, gitignore: bool) -> io::Result<HashMap<
         }
         let path = top.join(git_path(&record[3..])?);
         let status = String::from_utf8_lossy(&record[..2]).into_owned();
+        let ignored = status == "!!";
         statuses.insert(path.clone(), status);
+        if ignored {
+            continue;
+        }
         for parent in path
             .ancestors()
             .skip(1)
@@ -359,6 +363,7 @@ fn list_dir(
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if (!config.all && name.starts_with('.'))
+            || (config.git && git.get(&entry.path()).is_none_or(|status| status == "!!"))
             || (config.gitignore
                 && entry
                     .path()
@@ -710,6 +715,17 @@ mod tests {
             );
         };
         git(&["init", "--quiet"]);
+        fs::create_dir_all(root.join("clean-dir")).unwrap();
+        fs::write(root.join("clean-dir/unchanged"), b"clean").unwrap();
+        fs::write(root.join("clean.txt"), b"clean").unwrap();
+        git(&["add", "clean.txt", "clean-dir/unchanged"]);
+        git(&[
+            "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "Baseline",
+        ]);
+        assert!(render(&["--git"], &root.join("clean-dir")).eq("clean-dir/\n"));
+        fs::create_dir_all(root.join("ignored-only")).unwrap();
+        fs::write(root.join("ignored-only/skip.log"), b"ignored").unwrap();
         fs::write(root.join(".gitignore"), "*.log\nnode_modules/\n").unwrap();
         git(&["add", "small.txt", "sub/child"]);
         fs::write(root.join("small.txt"), b"modified").unwrap();
@@ -718,11 +734,25 @@ mod tests {
         let output = render(&["--git"], &root);
         assert!(output.contains("small.txt [AM]"), "{output}");
         assert!(output.contains("large.bin [??]"));
-        assert!(output.contains("skip.log [!!]"));
+        assert!(!output.contains("skip.log"));
+        assert!(!output.contains("node_modules"));
+        assert!(!output.contains("ignored-only"));
+        assert!(!output.contains("clean.txt"));
+        assert!(!output.contains("clean-dir"));
+        assert!(!output.contains(".gitignore"));
+        let all = render(&["--git", "--all"], &root);
+        assert!(all.contains(".gitignore [??]"));
+        assert!(!all.contains(".git/"));
+        assert!(!all.contains("skip.log"));
         assert!(output.contains("sub/ [**]"));
         assert!(output.contains("new\\nfile [??]"));
         assert!(render(&["--git"], &root.join("sub")).contains("new\\nfile [??]"));
         assert!(!render(&[], &root).contains("[??]"));
+        assert!(render(&[], &root).contains("clean.txt"));
+        let limited = render(&["--git", "--depth", "1", "--ignore", "*.bin"], &root);
+        assert!(limited.contains("sub/ [**] [depth limit]"));
+        assert!(!limited.contains("new\\nfile"));
+        assert!(!limited.contains("large.bin"));
         fs::write(root.join("sub/.gitignore"), "*.tmp\n!keep.tmp\n").unwrap();
         fs::write(root.join("sub/drop.tmp"), b"ignored").unwrap();
         fs::write(root.join("sub/keep.tmp"), b"included").unwrap();

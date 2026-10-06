@@ -20,7 +20,7 @@ Options:
   --ignore LIST  Comma-separated name patterns (* and ?); repeatable
   --size         Show file sizes (decimal units)
   --sort KEY     Sort by name, size (largest), or modified (newest)
-  --git          Show Git status
+  --git          Show only Git-changed/untracked entries with status
   --gitignore    Skip Git-ignored entries (requires a working tree)
   --summary      Count displayed directories and files
   -a, --all       Show hidden entries
@@ -63,9 +63,11 @@ not its target). Directory sizes are not calculated. Sorting defaults to name;
 size sorts largest first (directories count as zero), modified sorts newest first,
 and ties sort by name. Sorting applies separately within each directory.
 
-`--git` runs Git once for status and requires Git and a working tree. It shows
+`--git` lists only changed and untracked entries reported by Git, plus their
+parent directories. Unchanged and ignored entries are excluded. It runs Git
+once for status and requires Git and a working tree. It shows
 Git's two-column status: the first column describes staged changes, the second
-unstaged changes; `??` means untracked, `!!` ignored, and `**` marks a directory
+unstaged changes; `??` means untracked, and `**` marks a directory
 containing changes. Renames appear as deletions and additions. Deleted entries
 are absent from the tree but still mark their parent directory. Hidden entries
 remain hidden unless `--all` is used. Git is invoked only with `--git` or

@@ -90,7 +90,8 @@ as files. Git status and summary are both disabled by default.
 ## Add program to PATH
 
 ```sh
-cargo install --path .
+make install
 ```
 
-Cargo installs `sls` into `~/.cargo/bin`; make sure that directory is in `PATH`.
+Requires Make and Cargo. This builds and installs `sls` into `~/.cargo/bin`
+by default; make sure that directory is in `PATH`.
